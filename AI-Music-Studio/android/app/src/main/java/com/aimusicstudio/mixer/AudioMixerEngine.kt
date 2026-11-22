@@ -5,13 +5,13 @@ import com.aimusicstudio.data.StemTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.tanh
 
 /**
- * Multi-track offline PCM audio mixer.
- * Combines active stems using current volume, Mute, Solo, and Removed states
- * and applies gentle soft-clipping limiting before writing a studio WAV file.
+ * Low-memory streaming multi-track PCM audio mixer.
+ * Mixes active WAV stems in 8192-frame chunks (< 1 MB RAM) with soft-clipping limiting.
  */
 object AudioMixerEngine {
 
@@ -32,37 +32,89 @@ object AudioMixerEngine {
             throw IllegalStateException("No active stems selected to export.")
         }
 
-        val decodedList = activeStems.map { stem ->
-            stem.volume to WavCodec.decodeAudioToStereoFloat(File(stem.filePath))
+        val chunkSize = 8192
+
+        // Fast streaming path for a single active stem (works for MP3/AAC/WAV)
+        if (activeStems.size == 1) {
+            val stem = activeStems.first()
+            val gain = stem.volume
+            var writer: WavCodec.StreamingWavWriter? = null
+            val outL = FloatArray(chunkSize)
+            val outR = FloatArray(chunkSize)
+            try {
+                WavCodec.streamDecodeStereoChunks(
+                    file = File(stem.filePath),
+                    chunkFrames = chunkSize,
+                    maxSeconds = 600,
+                    onHeader = { sr -> writer = WavCodec.StreamingWavWriter(outputFile, sr) },
+                    onChunk = { l, r, count, _ ->
+                        for (i in 0 until count) {
+                            val ml = l[i] * gain
+                            val mr = r[i] * gain
+                            outL[i] = if (abs(ml) > 0.95f) tanh(ml.toDouble()).toFloat() else ml
+                            outR[i] = if (abs(mr) > 0.95f) tanh(mr.toDouble()).toFloat() else mr
+                        }
+                        writer?.writeChunk(outL, outR, count)
+                    }
+                )
+            } finally {
+                writer?.close()
+            }
+            return@withContext outputFile
         }
 
-        val sampleRate = decodedList.first().second.sampleRate
-        val maxFrames = decodedList.maxOf { it.second.left.size }
-        val mixL = FloatArray(maxFrames)
-        val mixR = FloatArray(maxFrames)
+        // Streaming multi-stem WAV mix
+        val readers = activeStems.map { stem ->
+            stem.volume to WavCodec.StreamingWavReader(File(stem.filePath))
+        }
+        val validReaders = readers.filter { it.second.isValidPcm16 }
+        if (validReaders.isEmpty()) {
+            readers.forEach { it.second.close() }
+            throw IllegalStateException("Selected stems are not valid PCM WAV files.")
+        }
 
-        for ((gain, audio) in decodedList) {
-            val len = audio.left.size
-            for (i in 0 until len) {
-                mixL[i] += audio.left[i] * gain
-                mixR[i] += audio.right[i] * gain
+        val sampleRate = validReaders.first().second.sampleRate
+        val mixL = FloatArray(chunkSize)
+        val mixR = FloatArray(chunkSize)
+        val tmpL = FloatArray(chunkSize)
+        val tmpR = FloatArray(chunkSize)
+
+        try {
+            WavCodec.StreamingWavWriter(outputFile, sampleRate).use { writer ->
+                while (true) {
+                    var maxRead = 0
+                    mixL.fill(0f)
+                    mixR.fill(0f)
+
+                    for ((gain, reader) in validReaders) {
+                        val n = reader.readChunk(tmpL, tmpR, chunkSize)
+                        if (n > 0) {
+                            maxRead = max(maxRead, n)
+                            for (i in 0 until n) {
+                                mixL[i] += tmpL[i] * gain
+                                mixR[i] += tmpR[i] * gain
+                            }
+                        }
+                    }
+
+                    if (maxRead == 0) break
+
+                    for (i in 0 until maxRead) {
+                        if (abs(mixL[i]) > 0.95f) mixL[i] = tanh(mixL[i].toDouble()).toFloat()
+                        if (abs(mixR[i]) > 0.95f) mixR[i] = tanh(mixR[i].toDouble()).toFloat()
+                    }
+                    writer.writeChunk(mixL, mixR, maxRead)
+                }
+            }
+        } finally {
+            readers.forEach {
+                try {
+                    it.second.close()
+                } catch (_: Exception) {
+                }
             }
         }
 
-        // Peak check + gentle soft-clipping limiter to prevent digital distortion
-        var peak = 0f
-        for (i in 0 until maxFrames) {
-            peak = max(peak, kotlin.math.abs(mixL[i]))
-            peak = max(peak, kotlin.math.abs(mixR[i]))
-        }
-        if (peak > 0.98f) {
-            for (i in 0 until maxFrames) {
-                mixL[i] = tanh(mixL[i].toDouble()).toFloat()
-                mixR[i] = tanh(mixR[i].toDouble()).toFloat()
-            }
-        }
-
-        WavCodec.writeStereoWav(outputFile, mixL, mixR, sampleRate)
         outputFile
     }
 }
