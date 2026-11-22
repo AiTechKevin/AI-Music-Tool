@@ -163,7 +163,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         isBusy = false,
                         progress = 0f,
                         progressMessage = "",
-                        statusBanner = "Imported "$title". Ready for AI Separation or Studio!"
+                        statusBanner = "Imported '$title'. Ready for AI Separation or Studio!"
                     )
                 }
                 onImported()
